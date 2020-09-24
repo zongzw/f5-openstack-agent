@@ -13,8 +13,12 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+import hashlib
+import json
+
 from enum import Enum
 from f5_openstack_agent.lbaasv2.drivers.bigip.utils import get_filter
+from f5_openstack_agent.lbaasv2.drivers.bigip import exceptions as f5_ex
 
 from oslo_log import log as logging
 
@@ -61,6 +65,9 @@ class ResourceType(Enum):
     ssl_cert_file = 35
     http_profile = 36
     oneconnect = 37
+    udp_monitor = 38
+    sip_monitor = 39
+    diameter_monitor = 40
 
 
 class BigIPResourceHelper(object):
@@ -77,6 +84,8 @@ class BigIPResourceHelper(object):
         p = pool_helper.create(bigip, pool)
     """
 
+    ResourceCache = {}
+
     def __init__(self, resource_type):
         """Initialize a resource helper."""
         self.resource_type = resource_type
@@ -92,8 +101,22 @@ class BigIPResourceHelper(object):
         include name and partition.
         :returns: created or updated resource object.
         """
+        partition = "default_internal"
+        if "partition" in model:
+            partition = model["partition"]
+
+        self.dumps_ResourceCache(model, partition)
         resource = self._resource(bigip)
-        obj = resource.create(**model)
+        if self.cache_and_exists_update(partition, model):
+            obj = resource.create(**model)
+        else:
+            name = model['name']
+            if resource.exists(name=name, partition=partition):
+                obj = resource.load(name=name, partition=partition)
+            else:
+                raise f5_ex.F5MissingConfiguration(
+                    "The configuration should exist on bigip, "
+                    "but not: (In partition %s ) %s" % (partition, name))
 
         return obj
 
@@ -112,6 +135,15 @@ class BigIPResourceHelper(object):
         :param name: Name of resource to delete.
         :param partition: Partition name for resou
         """
+        self.dumps_ResourceCache(None, partition)
+        if not partition:
+            partition = 'default_internal'
+
+        key_name = "%s:%s" % (self.resource_type, name)
+        if partition in BigIPResourceHelper.ResourceCache and \
+            key_name in BigIPResourceHelper.ResourceCache[partition]:
+            del BigIPResourceHelper.ResourceCache[partition][key_name]
+
         resource = self._resource(bigip)
         if resource.exists(name=name, partition=partition):
             obj = resource.load(name=name, partition=partition)
@@ -141,11 +173,16 @@ class BigIPResourceHelper(object):
         :param model: Dictionary of BIG-IP attributes to update resource.
         Must include name and partition in order to identify resource.
         """
+
         partition = None
         if "partition" in model:
             partition = model["partition"]
+
+        self.dumps_ResourceCache(model, partition)
         resource = self.load(bigip, name=model["name"], partition=partition)
-        resource.modify(**model)
+        if self.cache_and_exists_update(partition, model):
+            LOG.debug("zongzw resource update: modifying resouce with model")
+            resource.modify(**model)
 
         return resource
 
@@ -205,6 +242,12 @@ class BigIPResourceHelper(object):
                 lambda bigip: bigip.tm.ltm.monitor.https_s.https,
             ResourceType.tcp_monitor:
                 lambda bigip: bigip.tm.ltm.monitor.tcps.tcp,
+            ResourceType.udp_monitor:
+                lambda bigip: bigip.tm.ltm.monitor.udps.udp,
+            ResourceType.sip_monitor:
+                lambda bigip: bigip.tm.ltm.monitor.sips.sip,
+            ResourceType.diameter_monitor:
+                lambda bigip: bigip.tm.ltm.monitor.diameters.diameter,
             ResourceType.ping_monitor:
                 lambda bigip: bigip.tm.ltm.monitor.gateway_icmps.gateway_icmp,
             ResourceType.node: lambda bigip: bigip.tm.ltm.nodes.node,
@@ -384,3 +427,82 @@ class BigIPResourceHelper(object):
                         stat_entries[stat_key]['description']
 
         return collected_stats
+
+    def cache_and_exists_update(self, partition, model):
+        '''
+        return True
+            if there are new updates to model compared with cached one in
+            BigIPResourceHelper.ResourceCache.
+
+        return False if any of
+            1) same model(with same hash) already exists in
+               BigIPResourceHelper.ResourceCache.
+            2) model is newly cached into BigIPResourceHelper.ResourceCache.
+
+        The cached items are maintained as:
+            1) grouped by partition.
+            2) the key is "self.resource_type:model['name']"
+
+            example:
+                {
+                    "Project_38ac07a46dad448cb93bec736ba89f1c": {
+                        "ResourceType.virtual:Project_bb072a34-f3c5-4c07-8856-e84043fb23ee": {
+                            "data": {
+                                "connectionLimit": 0,
+                                "description": "",
+                                "destination": "172.24.4.8:8443",
+                                "enabled": true,
+                                "fallbackPersistence": "",
+                                "ipProtocol": "tcp",
+                                "mask": "255.255.255.255",
+                                "name": "Project_bb072a34-f3c5-4c07-8856-e84043fb23ee",
+                                "partition": "Project_38ac07a46dad448cb93bec736ba89f1c",
+                                "persist": [],
+                                "policies": [],
+                                "pool": "",
+                                "profiles": [
+                                    "/Common/fastL4"
+                                ],
+                                "rules": [],
+                                "sourceAddressTranslation": {
+                                    "type": "automap"
+                                },
+                                "vlans": [],
+                                "vlansDisabled": true
+                            },
+                            "hash": "d45269e1cd8b3bc86b9b13904559c7f1"
+                        }
+                    }
+                }
+        '''
+
+        updates = False
+        md5hash = hashlib.md5(json.dumps(model))
+        md5 = md5hash.hexdigest()
+
+        if not partition in BigIPResourceHelper.ResourceCache:
+            BigIPResourceHelper.ResourceCache[partition] = {}
+            updates = True
+
+        key_name = "%s:%s" % (self.resource_type, model['name'])
+        if not key_name in BigIPResourceHelper.ResourceCache[partition]:
+            BigIPResourceHelper.ResourceCache[partition][key_name] = {
+                "hash": md5,
+                "data": model
+            }
+            updates = False
+        elif BigIPResourceHelper.ResourceCache[partition][key_name]['hash'] == md5:
+                updates = True
+
+        return updates
+
+    def dumps_ResourceCache(self, model=None, partition=None):
+        # LOG.debug('zongzw resource update: bigip: %s' % bigip)
+        # LOG.debug('zongzw resource update: resource type: %s' % self.resource_type)
+        if model:
+            LOG.debug('zongzw resource update: model: %s' % model)
+        if partition:
+            LOG.debug('zongzw resource update: partition: %s' % partition)
+
+        LOG.debug('zongzw resource update: BigIPResourceHelper.ResourceCache:'
+            ' %s' % json.dumps(BigIPResourceHelper.ResourceCache, indent=2))

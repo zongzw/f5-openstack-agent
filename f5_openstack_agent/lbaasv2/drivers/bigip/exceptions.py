@@ -536,3 +536,7 @@ class F5InvalidConfigurationOption(F5AgentException):
     message = translators.primary(
         "An invalid value was provided for %(opt_name)s: "
         "%(opt_value)s.")
+
+class F5MissingConfiguration(F5AgentException):
+    pass
+
